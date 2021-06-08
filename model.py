@@ -8,6 +8,7 @@ import tensorflow as tf
 import tensorflow_hub as hub
 import tensorflow_text as text
 from tensorflow.keras.optimizers import Adam
+from official.nlp import optimization  # to create AdamW optimizer
 
 import matplotlib.pyplot as plt
 
@@ -164,12 +165,18 @@ tfhub_handle_preprocess = map_model_to_preprocess[bert_model_name]
 
 def build_classifier_model():
     text_input = tf.keras.layers.Input(shape=(), dtype=tf.string, name='text')
-    preprocessing_layer = hub.KerasLayer(tfhub_handle_preprocess, name='preprocessing')
-    encoder_inputs = preprocessing_layer(text_input)
+    preprocessor = hub.load("https://tfhub.dev/tensorflow/bert_en_uncased_preprocess/3")
+    tokenize = hub.KerasLayer(preprocessor.tokenize)
+    tokenized_inputs = [tokenize(text_input)]
+    seq_length = 500  # Your choice here.
+    bert_pack_inputs = hub.KerasLayer(
+        preprocessor.bert_pack_inputs,
+        arguments=dict(seq_length=seq_length))
+    encoder_inputs = bert_pack_inputs(tokenized_inputs)
     encoder = hub.KerasLayer(tfhub_handle_encoder, trainable=True, name='BERT_encoder')
     outputs = encoder(encoder_inputs)
     net = outputs['pooled_output']
-    net = tf.keras.layers.Dropout(0.1)(net)
+    net = tf.keras.layers.Dropout(0.8)(net)
     net = tf.keras.layers.Dense(1, activation=None, name='classifier')(net)
     return tf.keras.Model(text_input, net)
 
@@ -178,21 +185,35 @@ classifier_model = build_classifier_model()
 loss = tf.keras.losses.BinaryCrossentropy(from_logits=True)
 metrics = tf.metrics.BinaryAccuracy()
 
-optimizer = Adam(
-    learning_rate=5e-05,
-    epsilon=1e-08,
-    decay=0.01,
-    clipnorm=1.0)
+epochs = 10
+steps_per_epoch = int(len(train_df) * 0.8) // 64
+num_train_steps = steps_per_epoch * epochs
+num_warmup_steps = int(0.05*num_train_steps)
+
+init_lr = 3e-5
+optimizer = optimization.create_optimizer(init_lr=init_lr,
+                                          num_train_steps=num_train_steps,
+                                          num_warmup_steps=num_warmup_steps,
+                                          optimizer_type='adamw')
 
 classifier_model.compile(optimizer=optimizer,
                          loss=loss,
                          metrics=metrics)
 
-history = classifier_model.fit(train_df['content'], y,
-                               validation_split=0.2, batch_size = 10,
-                               epochs=1)
+print(len(train_df), len(test_df))
 
-dataset_name = 'fake'
-saved_model_path = './{}_bert'.format(dataset_name.replace('/', '_'))
+es_callback = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=0)
 
-classifier_model.save(saved_model_path, include_optimizer=False)
+history = classifier_model.fit(train_df['content'], train_df['label'],
+                               validation_split=0.2, batch_size = 20,
+                               epochs=epochs, callbacks=[es_callback])
+
+# dataset_name = 'fake'
+# saved_model_path = './{}_bert'.format(dataset_name.replace('/', '_'))
+
+# classifier_model.save(saved_model_path, include_optimizer=False)
+
+loss, accuracy = classifier_model.evaluate(test_df['content'], test_df['label'])
+
+print(f'Loss: {loss}')
+print(f'Accuracy: {accuracy}')
